@@ -1,0 +1,19 @@
+# Core
+numpy
+pandas
+matplotlib
+scikit-learn
+mne
+scipy
+torch
+skorch
+einops
+
+# EEG/BCI libs
+braindecode
+
+# MOABB (GitHub install as requested)
+git+https://github.com/NeuroTechX/moabb.git
+
+# Development
+pytest
