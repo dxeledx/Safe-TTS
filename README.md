@@ -3,9 +3,14 @@
 Safe-TTS is a research codebase for **safe test-time strategy selection** on
 motor-imagery EEG. The current main line uses strict leave-one-subject-out
 (LOSO) evaluation on **PhysioNetMI 3-class** (`left_hand / right_hand / feet`):
-an `EEGNet + EA` anchor is compared with public TTA candidates, then a
-calibrated selector decides per target subject whether to accept a candidate or
-fall back to the anchor.
+an `EEGNet` anchor is compared with public TTA candidates, then a calibrated
+selector decides whether to accept a candidate or fall back to the anchor.
+
+The newest experimental line is a **streaming warm-up Safe-TTS** protocol:
+the first `W` unlabeled target trials are served to users with anchor-only
+predictions while candidate TTA methods run in the background for diagnosis.
+After the warm-up prefix, Safe-TTS selects one candidate or keeps the anchor,
+then monitors the selected candidate online and can fall back to the anchor.
 
 The repository also keeps the classical CSP/LDA line used during method
 development, including Euclidean alignment (EA), OEA/EA-ZO variants, diagnostic
@@ -16,11 +21,16 @@ plots, and result-summary utilities.
 - **Name**: Safe-TTS
 - **Primary task**: PhysioNetMI 3-class motor imagery
 - **Protocol**: strict LOSO; target labels are not used for test-time selection
-- **Anchor**: `eegnet_ea`
-- **Candidate pool**: `tent`, `t3a`, `cotta`, `shot`, `coral`
-- **Selector**: multi-view evidential deployment selector with outer risk
-  calibration
-- **Canonical config**: `D3`
+- **Anchor**: `eegnet_noea`
+- **Candidate pool**: `adabn`, `shot`, `tent`, `note`, `sar`, `pl`, `delta`,
+  `ttime`, `cotta`, `t3a`
+- **Offline selector**: multi-view evidential deployment selector with outer
+  risk calibration (`D3`)
+- **Streaming selector**: warm-up prefix selector with
+  `absolute_core / relative_core / koopman_temporal`
+- **Current confirmed streaming config**:
+  `W=8`, `risk_alpha=0.40`, `min_utility_threshold=0.010`,
+  `fallback_patience=2`
 
 In the current implementation, `D3` means:
 
@@ -121,6 +131,23 @@ python3 scripts/safe_tts/run_physionetmi3_safe_tts.py \
 The selector writes calibrated selection summaries, diagnostics, and the final
 Safe-TTS method comparison files under the requested output directory.
 
+Run the streaming warm-up Safe-TTS selector:
+
+```bash
+python3 scripts/safe_tts/run_warmup_safe_tts_from_predictions.py \
+  --preds outputs/physionetmi3_tta_suite/predictions_all_methods.csv \
+  --out-dir outputs/physionetmi3_warmup_safe_tts \
+  --anchor-method eegnet_noea \
+  --warmup-trials 8 \
+  --risk-alpha 0.40 \
+  --min-utility-threshold 0.010 \
+  --online-fallback \
+  --fallback-patience 2
+```
+
+This protocol reports both suffix gain after the warm-up and end-to-end gain
+including the anchor-only prefix.
+
 ## Classical CSP/LDA Baselines
 
 The older but still useful CSP/LDA pipeline remains available for strict LOSO
@@ -162,6 +189,9 @@ experiment jobs.
 - Current method notes live in `docs/current/`.
 - Experiment-note conventions live in `docs/experiments/README.md`.
 - Related work and comparability notes live in `docs/SOTA.md`.
+- Warm-up Safe-TTS notes:
+  - `docs/experiments/20260427_warmup_safe_tts_protocol.md`
+  - `docs/experiments/20260428_warmup_safe_tts_param_sweep.md`
 - Refresh the local result registry with:
 
 ```bash
