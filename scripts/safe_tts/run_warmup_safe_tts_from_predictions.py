@@ -51,6 +51,9 @@ class ScoredCandidate:
     p_benefit: float
 
 
+BASE_FEATURE_NAMES = ("absolute_core", "relative_core", "koopman_temporal")
+
+
 def _parse_csv_list(raw: str) -> list[str]:
     return [x.strip() for x in str(raw).split(",") if x.strip()]
 
@@ -153,6 +156,21 @@ def _chunk_bounds(n_rows: int, n_chunks: int) -> list[tuple[int, int]]:
     return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if int(b) > int(a)]
 
 
+def _effective_koopman_chunks(
+    *,
+    n_rows: int,
+    max_chunks: int,
+    dynamic: bool,
+    disable_below: int,
+) -> int:
+    n_rows = int(n_rows)
+    if int(disable_below) > 0 and n_rows < int(disable_below):
+        return 0
+    if bool(dynamic):
+        return int(min(max(1, int(max_chunks)), max(2, n_rows // 8)))
+    return int(max(1, int(max_chunks)))
+
+
 def _ridge_koopman(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
     # Rows are observations, columns are the low-dimensional block state.
     x_t = np.asarray(x, dtype=np.float64).T
@@ -202,6 +220,10 @@ def _koopman_temporal_instability(
     if len(states) < 2:
         return 0.0
     z = np.vstack(states)
+    mu = np.mean(z, axis=0, keepdims=True)
+    sigma = np.std(z, axis=0, keepdims=True)
+    sigma = np.where(sigma > 1e-8, sigma, 1.0)
+    z = (z - mu) / sigma
     x = z[:-1]
     y = z[1:]
     k = _ridge_koopman(x, y, lam=float(ridge_lambda))
@@ -237,18 +259,61 @@ def _core_features(
         conflict_tau=float(conflict_tau),
         conflict_lambda=float(conflict_lambda),
     )
-    temporal = _koopman_temporal_instability(
-        p0=p0,
-        p1=p1,
-        y0=y0,
-        y1=y1,
-        n_chunks=int(n_chunks),
-        ridge_lambda=float(ridge_lambda),
-        spectral_gamma=float(spectral_gamma),
-        conflict_tau=float(conflict_tau),
-        conflict_lambda=float(conflict_lambda),
-    )
+    if int(n_chunks) < 2:
+        temporal = 0.0
+    else:
+        temporal = _koopman_temporal_instability(
+            p0=p0,
+            p1=p1,
+            y0=y0,
+            y1=y1,
+            n_chunks=int(n_chunks),
+            ridge_lambda=float(ridge_lambda),
+            spectral_gamma=float(spectral_gamma),
+            conflict_tau=float(conflict_tau),
+            conflict_lambda=float(conflict_lambda),
+        )
     return np.asarray([absolute, relative, temporal], dtype=np.float64)
+
+
+def _method_onehot(method: str, candidate_methods: list[str]) -> np.ndarray:
+    z = np.zeros((len(candidate_methods),), dtype=np.float64)
+    if str(method) in candidate_methods:
+        z[int(candidate_methods.index(str(method)))] = 1.0
+    return z
+
+
+def _augment_feature_vector(
+    x: np.ndarray,
+    *,
+    method: str,
+    candidate_methods: list[str],
+    method_prior_mode: str,
+) -> np.ndarray:
+    base = np.asarray(x, dtype=np.float64).reshape(-1)
+    mode = str(method_prior_mode).strip().lower()
+    if mode == "none":
+        return base
+    if mode == "onehot":
+        return np.concatenate([base, _method_onehot(method, candidate_methods)], axis=0)
+    raise ValueError(f"Unsupported method_prior_mode={method_prior_mode!r}")
+
+
+def _feature_metadata(
+    *,
+    candidate_methods: list[str],
+    method_prior_mode: str,
+) -> tuple[tuple[str, ...], dict[str, tuple[int, int]]]:
+    names: list[str] = list(BASE_FEATURE_NAMES)
+    view_slices: dict[str, tuple[int, int]] = {
+        "absolute_core": (0, 1),
+        "relative_core": (1, 2),
+        "koopman_temporal": (2, 3),
+    }
+    if str(method_prior_mode).strip().lower() == "onehot":
+        names.extend([f"method={m}" for m in candidate_methods])
+        view_slices["strategy_prior"] = (3, 3 + len(candidate_methods))
+    return tuple(names), view_slices
 
 
 def _state_from_gain(gain: float, delta: float) -> int:
@@ -294,6 +359,8 @@ def _train_selector(
     samples_by_subject: dict[int, list[Sample]],
     train_subjects: Iterable[int],
     *,
+    candidate_methods: list[str],
+    method_prior_mode: str,
     outcome_delta: float,
     hidden_dim: int,
     epochs: int,
@@ -313,7 +380,14 @@ def _train_selector(
     groups: list[int] = []
     for s in train_subjects:
         for sample in samples_by_subject[int(s)]:
-            rows.append(np.asarray(sample.x, dtype=np.float64).reshape(-1))
+            rows.append(
+                _augment_feature_vector(
+                    sample.x,
+                    method=str(sample.method),
+                    candidate_methods=candidate_methods,
+                    method_prior_mode=str(method_prior_mode),
+                )
+            )
             states.append(_state_from_gain(sample.suffix_gain, delta=float(outcome_delta)))
             gains.append(float(sample.suffix_gain))
             groups.append(int(s))
@@ -323,17 +397,17 @@ def _train_selector(
     y_state = np.asarray(states, dtype=int)
     y_gain = np.asarray(gains, dtype=np.float64)
     group_ids = np.asarray(groups, dtype=int)
+    feature_names, view_slices = _feature_metadata(
+        candidate_methods=candidate_methods,
+        method_prior_mode=str(method_prior_mode),
+    )
     return train_evidential_selector(
         x,
         y_state,
         y_gain,
         group_ids,
-        feature_names=("absolute_core", "relative_core", "koopman_temporal"),
-        view_slices={
-            "absolute_core": (0, 1),
-            "relative_core": (1, 2),
-            "koopman_temporal": (2, 3),
-        },
+        feature_names=feature_names,
+        view_slices=view_slices,
         hidden_dim=int(hidden_dim),
         lr=float(lr),
         weight_decay=float(weight_decay),
@@ -349,10 +423,26 @@ def _train_selector(
     )
 
 
-def _score_samples(selector, samples: list[Sample]) -> list[ScoredCandidate]:
+def _score_samples(
+    selector,
+    samples: list[Sample],
+    *,
+    candidate_methods: list[str],
+    method_prior_mode: str,
+) -> list[ScoredCandidate]:
     if not samples:
         return []
-    x = np.vstack([np.asarray(s.x, dtype=np.float64).reshape(-1) for s in samples])
+    x = np.vstack(
+        [
+            _augment_feature_vector(
+                s.x,
+                method=str(s.method),
+                candidate_methods=candidate_methods,
+                method_prior_mode=str(method_prior_mode),
+            )
+            for s in samples
+        ]
+    )
     stats = selector.predict_stats(x)
     probs = np.asarray(stats["probs"], dtype=np.float64)
     risk = np.asarray(stats["risk"], dtype=np.float64).reshape(-1)
@@ -379,15 +469,48 @@ def _select_candidate(
     *,
     risk_threshold: float,
     utility_threshold: float,
+    risk_only_selection: bool,
+    selection_policy: str,
+    default_candidate_method: str,
+    switch_utility_margin: float,
 ) -> ScoredCandidate | None:
+    def is_feasible(c: ScoredCandidate) -> bool:
+        utility_ok = bool(risk_only_selection) or float(c.utility) >= float(utility_threshold)
+        return float(c.risk) <= float(risk_threshold) and utility_ok
+
     feasible = [
         c
         for c in scored
-        if float(c.risk) <= float(risk_threshold) and float(c.utility) >= float(utility_threshold)
+        if is_feasible(c)
     ]
     if not feasible:
         return None
-    return max(feasible, key=lambda c: (float(c.utility), -float(c.risk), float(c.sample.e2e_gain)))
+
+    policy = str(selection_policy).strip().lower()
+    if policy == "free":
+        return max(feasible, key=lambda c: (float(c.utility), -float(c.risk), float(c.sample.e2e_gain)))
+
+    if policy != "default_veto_switch":
+        raise ValueError(f"Unsupported selection_policy={selection_policy!r}")
+
+    default_method = str(default_candidate_method).strip()
+    default = next((c for c in scored if str(c.sample.method) == default_method), None)
+    if default is None:
+        return max(feasible, key=lambda c: (float(c.utility), -float(c.risk), float(c.sample.e2e_gain)))
+
+    margin = float(switch_utility_margin)
+    switchers = [
+        c
+        for c in feasible
+        if str(c.sample.method) != default_method and float(c.utility) >= float(default.utility) + margin
+    ]
+    if is_feasible(default):
+        if switchers:
+            return max(switchers, key=lambda c: (float(c.utility), -float(c.risk), float(c.sample.e2e_gain)))
+        return default
+    if not switchers:
+        return None
+    return max(switchers, key=lambda c: (float(c.utility), -float(c.risk), float(c.sample.e2e_gain)))
 
 
 def _evaluate_subject_actions(
@@ -397,6 +520,10 @@ def _evaluate_subject_actions(
     risk_threshold: float,
     utility_threshold: float,
     neg_eps: float,
+    risk_only_selection: bool,
+    selection_policy: str,
+    default_candidate_method: str,
+    switch_utility_margin: float,
 ) -> dict[str, float]:
     gains: list[float] = []
     suffix_gains: list[float] = []
@@ -407,6 +534,10 @@ def _evaluate_subject_actions(
             scored_by_subject[int(s)],
             risk_threshold=float(risk_threshold),
             utility_threshold=float(utility_threshold),
+            risk_only_selection=bool(risk_only_selection),
+            selection_policy=str(selection_policy),
+            default_candidate_method=str(default_candidate_method),
+            switch_utility_margin=float(switch_utility_margin),
         )
         if chosen is None:
             gains.append(0.0)
@@ -424,21 +555,34 @@ def _evaluate_subject_actions(
         "harm": float(harm),
         "mean_e2e_gain": float(np.mean(gains)) if gains else 0.0,
         "mean_suffix_gain": float(np.mean(suffix_gains)) if suffix_gains else 0.0,
+        "tail_e2e_gain": _tail_mean(gains, frac=0.10),
+        "tail_suffix_gain": _tail_mean(suffix_gains, frac=0.10),
         "accept_rate": float(accepted / max(1, n)),
         "cond_harm_rate": float(harm / accepted) if accepted > 0 else 0.0,
     }
+
+
+def _tail_mean(values: Iterable[float], frac: float = 0.10) -> float:
+    arr = np.sort(np.asarray(list(values), dtype=np.float64).reshape(-1))
+    if arr.size == 0:
+        return 0.0
+    k = max(1, int(math.ceil(float(frac) * int(arr.size))))
+    return float(np.mean(arr[:k]))
 
 
 def _threshold_candidates(
     scored_by_subject: dict[int, list[ScoredCandidate]],
     *,
     min_utility_threshold: float,
+    risk_only_selection: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     risks = np.asarray([c.risk for rows in scored_by_subject.values() for c in rows], dtype=np.float64)
     utils = np.asarray([c.utility for rows in scored_by_subject.values() for c in rows], dtype=np.float64)
     if risks.size == 0 or utils.size == 0:
         return np.asarray([0.0]), np.asarray([math.inf])
     r_grid = np.unique(np.concatenate([np.linspace(0.0, 1.0, 21), np.quantile(risks, np.linspace(0.0, 1.0, 21))]))
+    if bool(risk_only_selection):
+        return np.asarray(r_grid, dtype=np.float64), np.asarray([float(min_utility_threshold)], dtype=np.float64)
     q_grid = np.unique(
         np.concatenate(
             [
@@ -462,10 +606,19 @@ def _choose_and_verify_thresholds(
     neg_eps: float,
     min_accept_rate: float,
     min_utility_threshold: float,
+    risk_only_selection: bool,
+    selection_policy: str,
+    default_candidate_method: str,
+    switch_utility_margin: float,
+    dev_objective: str,
+    lambda_tail: float,
+    lambda_accept: float,
+    tail_frac: float,
 ) -> dict[str, float | bool | str]:
     r_grid, q_grid = _threshold_candidates(
         {s: oof_scored[int(s)] for s in dev_subjects},
         min_utility_threshold=float(min_utility_threshold),
+        risk_only_selection=bool(risk_only_selection),
     )
     best: dict[str, float] | None = None
     for r_thr in r_grid:
@@ -476,16 +629,83 @@ def _choose_and_verify_thresholds(
                 risk_threshold=float(r_thr),
                 utility_threshold=float(q_thr),
                 neg_eps=float(neg_eps),
+                risk_only_selection=bool(risk_only_selection),
+                selection_policy=str(selection_policy),
+                default_candidate_method=str(default_candidate_method),
+                switch_utility_margin=float(switch_utility_margin),
             )
             if float(m["accept_rate"]) < float(min_accept_rate):
                 continue
-            obj = float(m["mean_e2e_gain"])
-            if best is None or obj > float(best["dev_mean_e2e_gain"]):
+            if str(dev_objective).strip().lower() == "tail_accept":
+                obj = (
+                    float(m["mean_e2e_gain"])
+                    + float(lambda_tail) * _tail_mean(
+                        [
+                            float(
+                                _select_candidate(
+                                    oof_scored[int(s)],
+                                    risk_threshold=float(r_thr),
+                                    utility_threshold=float(q_thr),
+                                    risk_only_selection=bool(risk_only_selection),
+                                    selection_policy=str(selection_policy),
+                                    default_candidate_method=str(default_candidate_method),
+                                    switch_utility_margin=float(switch_utility_margin),
+                                ).sample.e2e_gain
+                            )
+                            if _select_candidate(
+                                oof_scored[int(s)],
+                                risk_threshold=float(r_thr),
+                                utility_threshold=float(q_thr),
+                                risk_only_selection=bool(risk_only_selection),
+                                selection_policy=str(selection_policy),
+                                default_candidate_method=str(default_candidate_method),
+                                switch_utility_margin=float(switch_utility_margin),
+                            )
+                            is not None
+                            else 0.0
+                            for s in dev_subjects
+                        ],
+                        frac=float(tail_frac),
+                    )
+                    + float(lambda_accept) * float(m["accept_rate"])
+                )
+            else:
+                obj = float(m["mean_e2e_gain"])
+            if best is None or obj > float(best["dev_objective_value"]):
                 best = {
                     "risk_threshold": float(r_thr),
                     "utility_threshold": float(q_thr),
+                    "dev_objective_value": float(obj),
                     "dev_mean_e2e_gain": float(m["mean_e2e_gain"]),
                     "dev_mean_suffix_gain": float(m["mean_suffix_gain"]),
+                    "dev_tail_e2e_gain": float(_tail_mean(
+                        [
+                            float(
+                                _select_candidate(
+                                    oof_scored[int(s)],
+                                    risk_threshold=float(r_thr),
+                                    utility_threshold=float(q_thr),
+                                    risk_only_selection=bool(risk_only_selection),
+                                    selection_policy=str(selection_policy),
+                                    default_candidate_method=str(default_candidate_method),
+                                    switch_utility_margin=float(switch_utility_margin),
+                                ).sample.e2e_gain
+                            )
+                            if _select_candidate(
+                                oof_scored[int(s)],
+                                risk_threshold=float(r_thr),
+                                utility_threshold=float(q_thr),
+                                risk_only_selection=bool(risk_only_selection),
+                                selection_policy=str(selection_policy),
+                                default_candidate_method=str(default_candidate_method),
+                                switch_utility_margin=float(switch_utility_margin),
+                            )
+                            is not None
+                            else 0.0
+                            for s in dev_subjects
+                        ],
+                        frac=float(tail_frac),
+                    )),
                     "dev_accept_rate": float(m["accept_rate"]),
                     "dev_cond_harm_rate": float(m["cond_harm_rate"]),
                 }
@@ -498,6 +718,10 @@ def _choose_and_verify_thresholds(
         risk_threshold=float(best["risk_threshold"]),
         utility_threshold=float(best["utility_threshold"]),
         neg_eps=float(neg_eps),
+        risk_only_selection=bool(risk_only_selection),
+        selection_policy=str(selection_policy),
+        default_candidate_method=str(default_candidate_method),
+        switch_utility_margin=float(switch_utility_margin),
     )
     n_acc = int(cal["accepted"])
     n_harm = int(cal["harm"])
@@ -569,6 +793,8 @@ def _build_samples_for_w(
     proba_cols: list[str],
     warmup_trials: int,
     n_chunks: int,
+    dynamic_koopman_chunks: bool,
+    disable_koopman_below_w: int,
     ridge_lambda: float,
     spectral_gamma: float,
     conflict_tau: float,
@@ -576,6 +802,12 @@ def _build_samples_for_w(
     min_suffix_trials: int,
 ) -> dict[int, list[Sample]]:
     samples: dict[int, list[Sample]] = {}
+    effective_chunks = _effective_koopman_chunks(
+        n_rows=int(warmup_trials),
+        max_chunks=int(n_chunks),
+        dynamic=bool(dynamic_koopman_chunks),
+        disable_below=int(disable_koopman_below_w),
+    )
     for s in subjects:
         df_a = by_method[str(anchor_method)][int(s)]
         n_total = int(df_a.shape[0])
@@ -604,7 +836,7 @@ def _build_samples_for_w(
                 df_anchor=df_a.iloc[:w].reset_index(drop=True),
                 df_candidate=df_c.iloc[:w].reset_index(drop=True),
                 proba_cols=proba_cols,
-                n_chunks=int(n_chunks),
+                n_chunks=int(effective_chunks),
                 ridge_lambda=float(ridge_lambda),
                 spectral_gamma=float(spectral_gamma),
                 conflict_tau=float(conflict_tau),
@@ -643,12 +875,16 @@ def _online_fallback_accuracy(
     anchor_method: str,
     chosen: ScoredCandidate,
     proba_cols: list[str],
+    candidate_methods: list[str],
+    method_prior_mode: str,
     warmup_trials: int,
     window_trials: int,
     fallback_risk_threshold: float,
     fallback_koopman_threshold: float,
     fallback_patience: int,
     n_chunks: int,
+    dynamic_koopman_chunks: bool,
+    disable_koopman_below_w: int,
     ridge_lambda: float,
     spectral_gamma: float,
     conflict_tau: float,
@@ -679,19 +915,31 @@ def _online_fallback_accuracy(
         obs_stop = t + 1
         if obs_stop - obs_start < max(2, min(int(window_trials), int(warmup_trials)) // 2):
             continue
-        x_win = _core_features(
+        effective_chunks = _effective_koopman_chunks(
+            n_rows=int(obs_stop - obs_start),
+            max_chunks=int(n_chunks),
+            dynamic=bool(dynamic_koopman_chunks),
+            disable_below=int(disable_koopman_below_w),
+        )
+        x_core = _core_features(
             df_anchor=df_a.iloc[obs_start:obs_stop].reset_index(drop=True),
             df_candidate=df_c.iloc[obs_start:obs_stop].reset_index(drop=True),
             proba_cols=proba_cols,
-            n_chunks=int(n_chunks),
+            n_chunks=int(effective_chunks),
             ridge_lambda=float(ridge_lambda),
             spectral_gamma=float(spectral_gamma),
             conflict_tau=float(conflict_tau),
             conflict_lambda=float(conflict_lambda),
+        )
+        x_win = _augment_feature_vector(
+            x_core,
+            method=method,
+            candidate_methods=candidate_methods,
+            method_prior_mode=str(method_prior_mode),
         ).reshape(1, -1)
         stats = selector.predict_stats(x_win)
         risk = float(np.asarray(stats["risk"]).reshape(-1)[0])
-        koop = float(x_win.reshape(-1)[2])
+        koop = float(x_core.reshape(-1)[2])
         bad = (risk > float(fallback_risk_threshold)) or (koop > float(fallback_koopman_threshold))
         bad_count = bad_count + 1 if bad else 0
         if bad_count >= int(fallback_patience):
@@ -723,6 +971,12 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
     )
     eval_subjects = _parse_eval_subjects(args.eval_subjects)
     subjects = subjects_all if eval_subjects is None else [s for s in subjects_all if int(s) in set(eval_subjects)]
+    if str(args.selection_policy).strip().lower() == "default_veto_switch":
+        default_method = str(args.default_candidate_method).strip() or (cand_methods[0] if cand_methods else "")
+        if default_method not in cand_methods:
+            raise RuntimeError(f"default_candidate_method={default_method!r} is not in candidate_methods={cand_methods}")
+    else:
+        default_method = str(args.default_candidate_method).strip() or (cand_methods[0] if cand_methods else "")
     methods = [str(args.anchor_method)] + cand_methods
     by_method = _build_subject_maps(df, methods=methods)
     _validate_alignment(by_method, methods=methods, subjects=subjects)
@@ -734,6 +988,8 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
         proba_cols=proba_cols,
         warmup_trials=int(w),
         n_chunks=int(args.koopman_chunks),
+        dynamic_koopman_chunks=bool(args.dynamic_koopman_chunks),
+        disable_koopman_below_w=int(args.disable_koopman_below_w),
         ridge_lambda=float(args.koopman_ridge),
         spectral_gamma=float(args.koopman_gamma),
         conflict_tau=float(args.conflict_tau),
@@ -755,6 +1011,8 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
             selector_fold = _train_selector(
                 samples_by_subject,
                 train_subjects,
+                candidate_methods=cand_methods,
+                method_prior_mode=str(args.method_prior_mode),
                 outcome_delta=float(args.outcome_delta),
                 hidden_dim=int(args.selector_hidden_dim),
                 epochs=int(args.selector_epochs),
@@ -769,7 +1027,12 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
                 progress_label=None,
             )
             for s in heldout:
-                oof[int(s)] = _score_samples(selector_fold, samples_by_subject[int(s)])
+                oof[int(s)] = _score_samples(
+                    selector_fold,
+                    samples_by_subject[int(s)],
+                    candidate_methods=cand_methods,
+                    method_prior_mode=str(args.method_prior_mode),
+                )
 
         dev_subjects, cal_subjects = _dev_cal_split(
             fit_subjects,
@@ -785,10 +1048,20 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
             neg_eps=float(args.neg_transfer_eps),
             min_accept_rate=float(args.min_accept_rate),
             min_utility_threshold=float(args.min_utility_threshold),
+            risk_only_selection=bool(args.risk_only_selection),
+            selection_policy=str(args.selection_policy),
+            default_candidate_method=str(default_method),
+            switch_utility_margin=float(args.switch_utility_margin),
+            dev_objective=str(args.dev_objective),
+            lambda_tail=float(args.lambda_tail),
+            lambda_accept=float(args.lambda_accept),
+            tail_frac=float(args.tail_frac),
         )
         selector_final = _train_selector(
             samples_by_subject,
             fit_subjects,
+            candidate_methods=cand_methods,
+            method_prior_mode=str(args.method_prior_mode),
             outcome_delta=float(args.outcome_delta),
             hidden_dim=int(args.selector_hidden_dim),
             epochs=int(args.selector_epochs),
@@ -802,12 +1075,21 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
             seed=int(args.seed) + 100000 + int(test_subject),
             progress_label=None,
         )
-        scored_test = _score_samples(selector_final, samples_by_subject[int(test_subject)])
+        scored_test = _score_samples(
+            selector_final,
+            samples_by_subject[int(test_subject)],
+            candidate_methods=cand_methods,
+            method_prior_mode=str(args.method_prior_mode),
+        )
         if bool(thr.get("verified", False)):
             chosen = _select_candidate(
                 scored_test,
                 risk_threshold=float(thr["risk_threshold"]),
                 utility_threshold=float(thr["utility_threshold"]),
+                risk_only_selection=bool(args.risk_only_selection),
+                selection_policy=str(args.selection_policy),
+                default_candidate_method=str(default_method),
+                switch_utility_margin=float(args.switch_utility_margin),
             )
         else:
             chosen = None
@@ -863,12 +1145,16 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
                     anchor_method=str(args.anchor_method),
                     chosen=chosen,
                     proba_cols=proba_cols,
+                    candidate_methods=cand_methods,
+                    method_prior_mode=str(args.method_prior_mode),
                     warmup_trials=int(w),
                     window_trials=int(args.fallback_window_trials or w),
                     fallback_risk_threshold=float(fb_thr),
                     fallback_koopman_threshold=float(args.fallback_koopman_threshold),
                     fallback_patience=int(args.fallback_patience),
                     n_chunks=int(args.koopman_chunks),
+                    dynamic_koopman_chunks=bool(args.dynamic_koopman_chunks),
+                    disable_koopman_below_w=int(args.disable_koopman_below_w),
                     ridge_lambda=float(args.koopman_ridge),
                     spectral_gamma=float(args.koopman_gamma),
                     conflict_tau=float(args.conflict_tau),
@@ -935,6 +1221,8 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
                 "cal_accept": float(thr.get("cal_accept", float("nan"))),
                 "cal_harm": float(thr.get("cal_harm", float("nan"))),
                 "cal_harm_ucb": float(thr.get("cal_harm_ucb", float("nan"))),
+                "dev_objective_value": float(thr.get("dev_objective_value", float("nan"))),
+                "dev_tail_e2e_gain": float(thr.get("dev_tail_e2e_gain", float("nan"))),
                 **fallback_info,
             }
         )
@@ -960,6 +1248,12 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
         "oracle_gap_e2e_mean": float(per_subject["oracle_gap_e2e"].mean()),
         "threshold_verified_rate": float(per_subject["threshold_verified"].mean()),
         "online_fallback": int(bool(args.online_fallback)),
+        "method_prior_mode": str(args.method_prior_mode),
+        "selection_policy": str(args.selection_policy),
+        "default_candidate_method": str(default_method),
+        "risk_only_selection": int(bool(args.risk_only_selection)),
+        "dev_objective": str(args.dev_objective),
+        "candidate_methods": ",".join(cand_methods),
         "fallback_rate_among_accepted": float(
             (per_subject.loc[per_subject["accept"] == 1, "fallback_at_trial"] >= 0).mean()
         )
@@ -981,6 +1275,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--method-name", type=str, default="safe-tts-warmup-koopman")
     p.add_argument("--date-prefix", type=str, default=datetime.now().strftime("%Y%m%d"))
     p.add_argument("--eval-subjects", type=str, default="ALL")
+    p.add_argument("--method-prior-mode", type=str, choices=("none", "onehot"), default="none")
+    p.add_argument("--selection-policy", type=str, choices=("free", "default_veto_switch"), default="free")
+    p.add_argument("--default-candidate-method", type=str, default="")
+    p.add_argument("--switch-utility-margin", type=float, default=0.0)
+    p.add_argument("--risk-only-selection", action="store_true")
 
     p.add_argument("--risk-alpha", type=float, default=0.40)
     p.add_argument("--cp-delta", type=float, default=0.05)
@@ -990,10 +1289,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-utility-threshold", type=float, default=0.0)
     p.add_argument("--neg-transfer-eps", type=float, default=0.0)
     p.add_argument("--outcome-delta", type=float, default=0.02)
+    p.add_argument("--dev-objective", type=str, choices=("mean", "tail_accept"), default="mean")
+    p.add_argument("--lambda-tail", type=float, default=0.0)
+    p.add_argument("--lambda-accept", type=float, default=0.0)
+    p.add_argument("--tail-frac", type=float, default=0.10)
 
     p.add_argument("--conflict-tau", type=float, default=0.80)
     p.add_argument("--conflict-lambda", type=float, default=1.0)
     p.add_argument("--koopman-chunks", type=int, default=4)
+    p.add_argument("--dynamic-koopman-chunks", action="store_true")
+    p.add_argument("--disable-koopman-below-w", type=int, default=0)
     p.add_argument("--koopman-ridge", type=float, default=1e-3)
     p.add_argument("--koopman-gamma", type=float, default=0.25)
     p.add_argument("--min-suffix-trials", type=int, default=8)
