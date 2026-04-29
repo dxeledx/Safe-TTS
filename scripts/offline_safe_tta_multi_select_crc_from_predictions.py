@@ -73,12 +73,31 @@ def _parse_selector_views(raw: str) -> list[str]:
     raw = str(raw).strip()
     if not raw:
         return ["stats"]
-    allowed = {"stats", "decision", "relative", "dynamic", "stochastic"}
+    aliases = {
+        "absolute": "absolute_core",
+        "absolute_core": "absolute_core",
+        "relative_core": "relative_core",
+        "koopman_temporal": "koopman_temporal",
+        "compact": "compact",
+    }
+    allowed = {
+        "stats",
+        "decision",
+        "relative",
+        "dynamic",
+        "koopman",
+        "stochastic",
+        "absolute_core",
+        "relative_core",
+        "koopman_temporal",
+        "compact",
+    }
     views: list[str] = []
     for part in raw.split(","):
         name = str(part).strip().lower()
         if not name:
             continue
+        name = aliases.get(name, name)
         if name not in allowed:
             raise ValueError(f"Invalid selector view {name!r}; expected one of {sorted(allowed)}.")
         if name not in views:
@@ -403,6 +422,141 @@ def _chunk_class_entropy(prob: np.ndarray, n_classes: int) -> float:
     return float(-np.sum(freq * np.log(freq)))
 
 
+def _entropy_vec(p: np.ndarray) -> float:
+    p = np.asarray(p, dtype=np.float64).reshape(-1)
+    p = np.clip(p, 1e-12, 1.0)
+    p = p / float(np.sum(p))
+    return float(-np.sum(p * np.log(p)))
+
+
+def _balanced_decision_reliability(p: np.ndarray) -> float:
+    p = np.asarray(p, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] <= 0:
+        return 0.0
+    p = np.clip(p, 1e-12, 1.0)
+    p = p / np.sum(p, axis=1, keepdims=True)
+    c = int(p.shape[1])
+    log_c = max(float(np.log(float(c))), 1e-12)
+    certainty = 1.0 - float(np.mean(_row_entropy(p))) / log_c
+    balance = _entropy_vec(np.mean(p, axis=0)) / log_c
+    return float(np.clip(certainty * balance, 0.0, 1.0))
+
+
+def _ridge_koopman(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
+    x_t = np.asarray(x, dtype=np.float64).T
+    y_t = np.asarray(y, dtype=np.float64).T
+    dim = int(x_t.shape[0])
+    return y_t @ x_t.T @ np.linalg.pinv(x_t @ x_t.T + float(lam) * np.eye(dim))
+
+
+def _spectral_radius(k: np.ndarray) -> float:
+    try:
+        eig = np.linalg.eigvals(np.asarray(k, dtype=np.float64))
+        return float(np.max(np.abs(eig))) if eig.size else 0.0
+    except Exception:
+        return 0.0
+
+
+def _koopman_view_features(
+    *,
+    p_id: np.ndarray,
+    p_c: np.ndarray,
+    y_pred_id: np.ndarray,
+    y_pred_c: np.ndarray,
+    n_chunks: int,
+    ridge_lambda: float,
+    spectral_gamma: float,
+    conflict_tau: float,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    p_id = np.asarray(p_id, dtype=np.float64)
+    p_c = np.asarray(p_c, dtype=np.float64)
+    y_pred_id = np.asarray(y_pred_id, dtype=object).reshape(-1)
+    y_pred_c = np.asarray(y_pred_c, dtype=object).reshape(-1)
+    states: list[np.ndarray] = []
+    for start, stop in _split_chunk_bounds(int(p_c.shape[0]), int(n_chunks)):
+        p_id_b = p_id[start:stop]
+        p_c_b = p_c[start:stop]
+        y_id_b = y_pred_id[start:stop]
+        y_c_b = y_pred_c[start:stop]
+        conf_id_b = np.max(p_id_b, axis=1)
+        conf_c_b = np.max(p_c_b, axis=1)
+        conflict = (y_id_b != y_c_b) & (conf_id_b >= float(conflict_tau)) & (conf_c_b >= float(conflict_tau))
+        states.append(
+            np.asarray(
+                [
+                    _balanced_decision_reliability(p_c_b),
+                    float(np.mean(_js_vec(p_id_b, p_c_b))) if p_c_b.shape[0] else 0.0,
+                    float(np.mean(conflict.astype(np.float64))) if p_c_b.shape[0] else 0.0,
+                ],
+                dtype=np.float64,
+            )
+        )
+    if len(states) < 2:
+        return np.asarray([0.0], dtype=np.float64), ("koopman_temporal",)
+    z = np.vstack(states)
+    mu = np.mean(z, axis=0, keepdims=True)
+    sigma = np.std(z, axis=0, keepdims=True)
+    sigma = np.where(sigma > 1e-8, sigma, 1.0)
+    z = (z - mu) / sigma
+    x = z[:-1]
+    y = z[1:]
+    k = _ridge_koopman(x, y, lam=float(ridge_lambda))
+    pred = (k @ x.T).T
+    resid = float(np.sum((y - pred) ** 2))
+    denom = float(np.sum(y**2) + 1e-12)
+    rho = _spectral_radius(k)
+    instability = float(resid / denom + float(spectral_gamma) * max(0.0, rho - 1.0) ** 2)
+    return np.asarray([instability], dtype=np.float64), ("koopman_temporal",)
+
+
+def _compact_three_view_features(
+    *,
+    p_id: np.ndarray,
+    p_c: np.ndarray,
+    y_pred_id: np.ndarray,
+    y_pred_c: np.ndarray,
+    n_chunks: int,
+    ridge_lambda: float,
+    spectral_gamma: float,
+    conflict_tau: float,
+    conflict_lambda: float = 1.0,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    p_id = np.asarray(p_id, dtype=np.float64)
+    p_c = np.asarray(p_c, dtype=np.float64)
+    y_pred_id = np.asarray(y_pred_id, dtype=object).reshape(-1)
+    y_pred_c = np.asarray(y_pred_c, dtype=object).reshape(-1)
+
+    absolute_core = _balanced_decision_reliability(p_c)
+
+    if p_c.shape[0] > 0:
+        js_norm = _js_vec(p_id, p_c) / max(float(np.log(2.0)), 1e-12)
+        conf_id = np.max(p_id, axis=1)
+        conf_c = np.max(p_c, axis=1)
+        high_conflict = (
+            (y_pred_id != y_pred_c)
+            & (conf_id >= float(conflict_tau))
+            & (conf_c >= float(conflict_tau))
+        )
+        relative_core = float(np.mean(js_norm * (1.0 + float(conflict_lambda) * high_conflict.astype(np.float64))))
+    else:
+        relative_core = 0.0
+
+    koop_feats, _ = _koopman_view_features(
+        p_id=p_id,
+        p_c=p_c,
+        y_pred_id=y_pred_id,
+        y_pred_c=y_pred_c,
+        n_chunks=int(n_chunks),
+        ridge_lambda=float(ridge_lambda),
+        spectral_gamma=float(spectral_gamma),
+        conflict_tau=float(conflict_tau),
+    )
+    return (
+        np.asarray([absolute_core, relative_core, float(koop_feats[0])], dtype=np.float64),
+        ("absolute_core", "relative_core", "koopman_temporal"),
+    )
+
+
 def _dynamic_view_features(
     *,
     p_id: np.ndarray,
@@ -552,6 +706,9 @@ def _selector_feature_bundle(
     dynamic_chunks: int,
     stochastic_bootstrap_rounds: int,
     stochastic_bootstrap_seed: int,
+    koopman_ridge: float = 1e-3,
+    koopman_gamma: float = 0.25,
+    koopman_conflict_tau: float = 0.80,
 ) -> tuple[np.ndarray, tuple[str, ...], dict[str, tuple[int, int]]]:
     rec_id = _record_from_proba(
         p_id=p_id,
@@ -598,6 +755,26 @@ def _selector_feature_bundle(
         n_classes=int(n_classes),
         n_chunks=int(dynamic_chunks),
     )
+    koop_feats, koop_names = _koopman_view_features(
+        p_id=p_id,
+        p_c=p_c,
+        y_pred_id=y_pred_id,
+        y_pred_c=y_pred_c,
+        n_chunks=int(dynamic_chunks),
+        ridge_lambda=float(koopman_ridge),
+        spectral_gamma=float(koopman_gamma),
+        conflict_tau=float(koopman_conflict_tau),
+    )
+    compact_feats, compact_names = _compact_three_view_features(
+        p_id=p_id,
+        p_c=p_c,
+        y_pred_id=y_pred_id,
+        y_pred_c=y_pred_c,
+        n_chunks=int(dynamic_chunks),
+        ridge_lambda=float(koopman_ridge),
+        spectral_gamma=float(koopman_gamma),
+        conflict_tau=float(koopman_conflict_tau),
+    )
     stoch_feats, stoch_names = _stochastic_view_features(
         p_id=p_id,
         p_c=p_c,
@@ -613,7 +790,12 @@ def _selector_feature_bundle(
         "decision": (np.asarray(dec_feats, dtype=np.float64), tuple(dec_names)),
         "relative": (np.asarray(rel_feats, dtype=np.float64), tuple(rel_names)),
         "dynamic": (np.asarray(dyn_feats, dtype=np.float64), tuple(dyn_names)),
+        "koopman": (np.asarray(koop_feats, dtype=np.float64), tuple(koop_names)),
         "stochastic": (np.asarray(stoch_feats, dtype=np.float64), tuple(stoch_names)),
+        "absolute_core": (np.asarray([compact_feats[0]], dtype=np.float64), ("absolute_core",)),
+        "relative_core": (np.asarray([compact_feats[1]], dtype=np.float64), ("relative_core",)),
+        "koopman_temporal": (np.asarray([compact_feats[2]], dtype=np.float64), ("koopman_temporal",)),
+        "compact": (np.asarray(compact_feats, dtype=np.float64), tuple(compact_names)),
     }
     feats_parts: list[np.ndarray] = []
     names_parts: list[str] = []
@@ -1013,7 +1195,11 @@ def _parse_args() -> argparse.Namespace:
         "--selector-views",
         type=str,
         default="stats,decision,relative",
-        help="Comma-separated evidential selector views. Choices: stats,decision,relative,dynamic,stochastic.",
+        help=(
+            "Comma-separated evidential selector views. Choices: "
+            "stats,decision,relative,dynamic,koopman,stochastic,"
+            "absolute_core,relative_core,koopman_temporal,compact."
+        ),
     )
     p.add_argument(
         "--dynamic-chunks",

@@ -1,81 +1,22 @@
 __pycache__/
 *.py[cod]
-*.pyo
-
-# macOS / editor noise
-.DS_Store
-.vscode/
-.idea/
-
-# Codex local metadata
-.codex/
-codex.remote.toml
-
-# Local Python environments / vendored deps
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
 venv/
 env/
-.pydeps/
-.pydeps
 
-# Local caches
-.joblib/
-.joblib
-.mne_config/
-.mne_config
-.mne_data/
-.mne_data
-.pytest_cache/
-.ipynb_checkpoints/
-.ruff_cache/
-.mypy_cache/
-
-# Local secrets / environment overrides
-.env
-.env.*
-
-# Generated outputs and experiment artifacts
+# Local experiment artifacts
 outputs/
-outputs_ts_lr_alignments/
 runs/
-runs_deeptransfer/
-artifacts/
 checkpoints/
-
-# Local datasets and binary exports
 data/
 datasets/
-*.npy
-*.npz
-*.mat
-*.edf
-*.fif
-*.pkl
-*.pickle
-*.ckpt
-*.pt
-*.pth
+*.log
 
-# Local MOABB/MNE cache + config (avoid polluting repo)
-.mne/
-.mne_home/
-.mne_data/
-.cache/
-
-# Large / local research artifacts
-docs/experiments/figures/
-docs/paper_assets/
-docs/paper_draft/
-docs/improve_330/
-docs/legacy/
-*.docx
-
-# Local reference papers/notes (often copyrighted; keep out of repo by default)
-papers/
-
-# External baseline repos / large reference implementations (kept locally)
-baseline/
-third_party_refs/
-
-# Scratch area used during local experiments
-trash/
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

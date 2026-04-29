@@ -1,206 +1,138 @@
 # Safe-TTS
 
-Safe-TTS is a research codebase for **safe test-time strategy selection** on
-motor-imagery EEG. The current main line uses strict leave-one-subject-out
-(LOSO) evaluation on **PhysioNetMI 3-class** (`left_hand / right_hand / feet`):
-an `EEGNet` anchor is compared with public TTA candidates, then a calibrated
-selector decides whether to accept a candidate or fall back to the anchor.
+Safe-TTS is a compact Python toolkit for selecting safe test-time strategies from saved prediction CSV files. It works on trial-level prediction tables produced by EEG/BCI classifiers or adaptation methods, then writes subject-level selections, merged predictions, and summary metrics.
 
-The newest experimental line is a **streaming warm-up Safe-TTS** protocol:
-the first `W` unlabeled target trials are served to users with anchor-only
-predictions while candidate TTA methods run in the background for diagnosis.
-After the warm-up prefix, Safe-TTS selects one candidate or keeps the anchor,
-then monitors the selected candidate online and can fall back to the anchor.
+The repository is intentionally small: it contains the selector scripts, feature/certificate utilities, and minimal dependencies needed to run them.
 
-The repository also keeps the classical CSP/LDA line used during method
-development, including Euclidean alignment (EA), OEA/EA-ZO variants, diagnostic
-plots, and result-summary utilities.
-
-## Current Method
-
-- **Name**: Safe-TTS
-- **Primary task**: PhysioNetMI 3-class motor imagery
-- **Protocol**: strict LOSO; target labels are not used for test-time selection
-- **Anchor**: `eegnet_noea`
-- **Candidate pool**: `adabn`, `shot`, `tent`, `note`, `sar`, `pl`, `delta`,
-  `ttime`, `cotta`, `t3a`
-- **Offline selector**: multi-view evidential deployment selector with outer
-  risk calibration (`D3`)
-- **Streaming selector**: warm-up prefix selector with
-  `absolute_core / relative_core / koopman_temporal`
-- **Current confirmed streaming config**:
-  `W=8`, `risk_alpha=0.40`, `min_utility_threshold=0.010`,
-  `fallback_patience=2`
-
-In the current implementation, `D3` means:
-
-- `calibration_protocol=paper_oof_dev_cal`
-- `selector_model=evidential`
-- `selector_views=stats,decision,relative`
-- `selector_hidden_dim=32`
-- `selector_epochs=50`
-- `selector_outcome_delta=0.02`
-- `guard_gray_margin=0.02`
-- `risk_alpha=0.40`
-
-## Repository Tree
+## File Tree
 
 ```text
-.
-├── csp_lda/                         # CSP/LDA, EA/OEA/ZO, metrics, plots, certificates
-├── docs/
-│   ├── current/                     # Current Safe-TTS method notes and experiment notes
-│   ├── experiments/README.md        # Lab-notebook convention
-│   └── SOTA.md                      # Related-work tracking table
-├── scripts/
-│   ├── safe_tts/                    # Canonical Safe-TTS wrappers
-│   ├── ttime_suite/                 # DeepTransferEEG/MOABB export and strict LOSO TTA suite
-│   ├── paper_supplement/            # Lightweight table/figure helpers
-│   ├── offline_safe_tta_multi_select_crc_from_predictions.py
-│   ├── offline_safe_tta_multi_select_from_predictions.py
-│   └── update_results_registry.py
-├── tests/                           # Small regression tests
-├── third_party/DeepTransferEEG/      # Vendored public baseline code used by the TTA suite
-├── run_csp_lda_loso.py              # Classical strict LOSO CSP/LDA entry point
-├── run_csp_lda_cross_session.py     # Within-subject cross-session diagnostic entry point
-└── requirements.txt
+Safe-TTS/
+├── README.md
+├── requirements.txt
+├── csp_lda/
+│   ├── __init__.py
+│   ├── alignment.py
+│   ├── certificate.py
+│   └── proba.py
+└── scripts/
+    ├── offline_safe_tta_multi_select_crc_from_predictions.py
+    ├── offline_safe_tta_multi_select_from_predictions.py
+    ├── offline_safe_tta_select_from_predictions.py
+    └── safe_tts/
+        ├── __init__.py
+        └── run_warmup_safe_tts_from_predictions.py
 ```
 
-Large generated artifacts are intentionally not versioned: `outputs/`,
-`runs/`, MNE/MOABB caches, checkpoints, exported `.npy` datasets, paper-asset
-packs, and local reference repositories should stay local.
+## Requirements
 
-## Installation
+- Python 3.10+
+- numpy
+- pandas
+- scipy
+- scikit-learn
+- torch
 
-Python 3.10+ is recommended. The original experiments were usually run in a
-Conda environment named `eeg`, but a virtual environment is also fine.
+Install with:
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -U pip
-python3 -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-If you use CUDA, install the PyTorch build that matches your driver before
-running the TTA suite.
+## Input Format
 
-## Data Preparation
+The main scripts expect a trial-level CSV with one row per method, subject, and trial:
 
-The deep TTA pipeline consumes a compact DeepTransferEEG-style export generated
-from MOABB:
-
-```bash
-python3 scripts/ttime_suite/export_moabb_for_deeptransfer.py \
-  --dataset physionetmi \
-  --events left_hand,right_hand,feet \
-  --out-dir /path/to/physionetmi3_export
+```text
+method,subject,trial,y_true,y_pred,proba_<class_1>,proba_<class_2>,...
 ```
 
-For the OpenBMI / Lee2019_MI 2-class extension:
+Example columns:
 
-```bash
-python3 scripts/ttime_suite/export_moabb_for_deeptransfer.py \
-  --dataset openbmi \
-  --events left_hand,right_hand \
-  --out-dir /path/to/openbmi2_export
+```text
+method,subject,trial,y_true,y_pred,proba_left_hand,proba_right_hand,proba_feet
 ```
 
-The export directory contains `X.npy`, `labels.npy`, `subject_idx.npy`,
-`meta.csv`, `class_order.json`, and `export_config.json`.
+Each candidate method should share the same `subject` and `trial` indexing as the anchor method.
 
-## Main Usage
+## Main Scripts
 
-Generate strict-LOSO predictions for the anchor and TTA candidates:
-
-```bash
-python3 scripts/safe_tts/run_physionetmi3_tta_suite.py \
-  --data-dir /path/to/physionetmi3_export \
-  --out-dir outputs/physionetmi3_tta_suite
-```
-
-Run Safe-TTS selection on the merged predictions:
+### Multi-candidate risk-controlled selector
 
 ```bash
-python3 scripts/safe_tts/run_physionetmi3_safe_tts.py \
-  --preds outputs/physionetmi3_tta_suite/predictions_all_methods.csv \
-  --risk-alpha 0.40 \
-  --out-dir outputs/physionetmi3_safe_tts_d3
-```
-
-The selector writes calibrated selection summaries, diagnostics, and the final
-Safe-TTS method comparison files under the requested output directory.
-
-Run the streaming warm-up Safe-TTS selector:
-
-```bash
-python3 scripts/safe_tts/run_warmup_safe_tts_from_predictions.py \
-  --preds outputs/physionetmi3_tta_suite/predictions_all_methods.csv \
-  --out-dir outputs/physionetmi3_warmup_safe_tts \
+python scripts/offline_safe_tta_multi_select_crc_from_predictions.py \
+  --preds outputs/predictions_all_methods.csv \
   --anchor-method eegnet_noea \
-  --warmup-trials 8 \
+  --candidate-methods ALL \
+  --selector-model evidential \
+  --selector-views stats,decision,relative \
+  --calibration-protocol paper_oof_dev_cal \
   --risk-alpha 0.40 \
-  --min-utility-threshold 0.010 \
-  --online-fallback \
-  --fallback-patience 2
+  --out-dir outputs/safe_tts_run \
+  --method-name safe_tts \
+  --date-prefix 20260429
 ```
 
-This protocol reports both suffix gain after the warm-up and end-to-end gain
-including the anchor-only prefix.
+Useful selector view options:
 
-## Classical CSP/LDA Baselines
+```text
+stats
+decision
+relative
+dynamic
+koopman
+stochastic
+absolute_core
+relative_core
+koopman_temporal
+compact
+```
 
-The older but still useful CSP/LDA pipeline remains available for strict LOSO
-baselines and OEA/EA-ZO diagnostics:
+The script writes:
+
+```text
+<date>_predictions_all_methods.csv
+<date>_per_subject_selection.csv
+<date>_method_comparison.csv
+```
+
+### Warm-up selector
 
 ```bash
-python3 run_csp_lda_loso.py
+python scripts/safe_tts/run_warmup_safe_tts_from_predictions.py \
+  --preds outputs/predictions_all_methods.csv \
+  --out-dir outputs/warmup_safe_tts \
+  --anchor-method eegnet_noea \
+  --candidate-methods adabn_kooptta_ref,shot_kooptta_ref,tent_kooptta_ref \
+  --warmup-trials 8,16,24,32 \
+  --warmup-feature-set compact \
+  --compact-selector-views absolute,relative,koopman \
+  --selection-policy default_veto_switch \
+  --default-candidate-method adabn_kooptta_ref \
+  --risk-alpha 0.40
 ```
 
-Common variants:
+This script evaluates a prefix-based selection protocol. It writes one per-subject CSV for each warm-up length and a combined method-comparison CSV.
+
+### Single-candidate selector
 
 ```bash
-python3 run_csp_lda_loso.py \
-  --preprocess paper_fir \
-  --n-components 6 \
-  --methods csp-lda,ea-csp-lda,ea-zo-im-csp-lda
-
-python3 run_csp_lda_cross_session.py \
-  --preprocess paper_fir \
-  --n-components 6
+python scripts/offline_safe_tta_select_from_predictions.py \
+  --ea-preds outputs/anchor_predictions.csv \
+  --cand-preds outputs/candidate_predictions.csv \
+  --out-dir outputs/single_candidate_run
 ```
 
-Outputs follow `outputs/YYYYMMDD/<N>class/...` and include result text files,
-per-trial predictions, confusion matrices, CSP patterns, and method comparison
-tables.
+## Core Utilities
 
-## Tests
+- `csp_lda/certificate.py`: feature construction, ridge certificates, logistic/HGB guards, and evidential selector training.
+- `csp_lda/alignment.py`: alignment helpers used by the shared certificate module.
+- `csp_lda/proba.py`: probability-column reordering helper.
 
-```bash
-python3 -m pytest tests
-```
+## Notes
 
-The tests are intentionally small and focus on stable helper behavior. Full EEG
-experiments require MOABB data downloads and are normally run as explicit
-experiment jobs.
-
-## Research Notes
-
-- Current method notes live in `docs/current/`.
-- Experiment-note conventions live in `docs/experiments/README.md`.
-- Related work and comparability notes live in `docs/SOTA.md`.
-- Warm-up Safe-TTS notes:
-  - `docs/experiments/20260427_warmup_safe_tts_protocol.md`
-  - `docs/experiments/20260428_warmup_safe_tts_param_sweep.md`
-- Refresh the local result registry with:
-
-```bash
-python3 scripts/update_results_registry.py \
-  --outputs-dir outputs \
-  --out docs/experiments/results_registry.csv
-```
-
-## License
-
-No project-level license has been declared yet. The vendored
-`third_party/DeepTransferEEG/` files keep their upstream license and notices.
+- The code operates on saved predictions; it does not require raw EEG data for selector evaluation.
+- Large experiment outputs, checkpoints, datasets, and generated figures are intentionally not tracked in this repository.
+- Keep prediction CSVs and result directories outside git, for example under `outputs/`.

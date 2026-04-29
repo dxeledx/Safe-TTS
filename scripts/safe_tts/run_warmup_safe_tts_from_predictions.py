@@ -19,6 +19,16 @@ if REPO_ROOT is not None and str(REPO_ROOT) not in sys.path:
 
 from csp_lda.certificate import train_evidential_selector
 
+SCRIPTS_ROOT = REPO_ROOT / "scripts" if REPO_ROOT is not None else None
+if SCRIPTS_ROOT is not None and str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from offline_safe_tta_multi_select_crc_from_predictions import (  # noqa: E402
+    _infer_family as _legacy_infer_family,
+    _parse_selector_views as _legacy_parse_selector_views,
+    _selector_feature_bundle as _legacy_selector_feature_bundle,
+)
+
 
 DEFAULT_CANDIDATES = "ALL"
 DEFAULT_WARMUP_GRID = "8,16,24,32"
@@ -52,10 +62,34 @@ class ScoredCandidate:
 
 
 BASE_FEATURE_NAMES = ("absolute_core", "relative_core", "koopman_temporal")
+_COMPACT_VIEW_ALIASES = {
+    "absolute": "absolute_core",
+    "absolute_core": "absolute_core",
+    "relative": "relative_core",
+    "relative_core": "relative_core",
+    "koopman": "koopman_temporal",
+    "temporal": "koopman_temporal",
+    "koopman_temporal": "koopman_temporal",
+}
 
 
 def _parse_csv_list(raw: str) -> list[str]:
     return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def _parse_compact_selector_views(raw: str) -> list[str]:
+    if not str(raw).strip():
+        raise ValueError("--compact-selector-views cannot be empty")
+    out: list[str] = []
+    for token in _parse_csv_list(raw):
+        key = str(token).strip().lower()
+        if key not in _COMPACT_VIEW_ALIASES:
+            allowed = ", ".join(sorted(_COMPACT_VIEW_ALIASES))
+            raise ValueError(f"Unknown compact selector view {token!r}. Allowed: {allowed}")
+        value = _COMPACT_VIEW_ALIASES[key]
+        if value not in out:
+            out.append(value)
+    return out
 
 
 def _parse_int_list(raw: str) -> list[int]:
@@ -276,6 +310,28 @@ def _core_features(
     return np.asarray([absolute, relative, temporal], dtype=np.float64)
 
 
+def _select_compact_features(
+    x: np.ndarray,
+    selected_views: list[str],
+) -> tuple[np.ndarray, tuple[str, ...], dict[str, tuple[int, int]]]:
+    values = np.asarray(x, dtype=np.float64).reshape(-1)
+    if values.shape[0] != len(BASE_FEATURE_NAMES):
+        raise RuntimeError(f"Expected {len(BASE_FEATURE_NAMES)} compact features, got {values.shape[0]}")
+    index = {name: i for i, name in enumerate(BASE_FEATURE_NAMES)}
+    cols: list[int] = []
+    names: list[str] = []
+    slices: dict[str, tuple[int, int]] = {}
+    for name in selected_views:
+        if name not in index:
+            raise RuntimeError(f"Unknown compact feature name {name!r}")
+        slices[name] = (len(cols), len(cols) + 1)
+        cols.append(int(index[name]))
+        names.append(str(name))
+    if not cols:
+        raise RuntimeError("At least one compact selector view is required.")
+    return values[np.asarray(cols, dtype=int)], tuple(names), slices
+
+
 def _method_onehot(method: str, candidate_methods: list[str]) -> np.ndarray:
     z = np.zeros((len(candidate_methods),), dtype=np.float64)
     if str(method) in candidate_methods:
@@ -301,18 +357,17 @@ def _augment_feature_vector(
 
 def _feature_metadata(
     *,
+    base_feature_names: tuple[str, ...],
+    base_view_slices: dict[str, tuple[int, int]],
     candidate_methods: list[str],
     method_prior_mode: str,
 ) -> tuple[tuple[str, ...], dict[str, tuple[int, int]]]:
-    names: list[str] = list(BASE_FEATURE_NAMES)
-    view_slices: dict[str, tuple[int, int]] = {
-        "absolute_core": (0, 1),
-        "relative_core": (1, 2),
-        "koopman_temporal": (2, 3),
-    }
+    names: list[str] = list(base_feature_names)
+    view_slices: dict[str, tuple[int, int]] = dict(base_view_slices)
     if str(method_prior_mode).strip().lower() == "onehot":
+        start = len(names)
         names.extend([f"method={m}" for m in candidate_methods])
-        view_slices["strategy_prior"] = (3, 3 + len(candidate_methods))
+        view_slices["strategy_prior"] = (start, start + len(candidate_methods))
     return tuple(names), view_slices
 
 
@@ -359,6 +414,8 @@ def _train_selector(
     samples_by_subject: dict[int, list[Sample]],
     train_subjects: Iterable[int],
     *,
+    base_feature_names: tuple[str, ...],
+    base_view_slices: dict[str, tuple[int, int]],
     candidate_methods: list[str],
     method_prior_mode: str,
     outcome_delta: float,
@@ -398,6 +455,8 @@ def _train_selector(
     y_gain = np.asarray(gains, dtype=np.float64)
     group_ids = np.asarray(groups, dtype=int)
     feature_names, view_slices = _feature_metadata(
+        base_feature_names=base_feature_names,
+        base_view_slices=base_view_slices,
         candidate_methods=candidate_methods,
         method_prior_mode=str(method_prior_mode),
     )
@@ -792,6 +851,13 @@ def _build_samples_for_w(
     subjects: list[int],
     proba_cols: list[str],
     warmup_trials: int,
+    warmup_feature_set: str,
+    compact_selector_views: list[str],
+    legacy_selector_views: list[str],
+    legacy_feature_mode: str,
+    legacy_dynamic_chunks: int,
+    legacy_stochastic_bootstrap_rounds: int,
+    legacy_stochastic_bootstrap_seed: int,
     n_chunks: int,
     dynamic_koopman_chunks: bool,
     disable_koopman_below_w: int,
@@ -800,7 +866,7 @@ def _build_samples_for_w(
     conflict_tau: float,
     conflict_lambda: float,
     min_suffix_trials: int,
-) -> dict[int, list[Sample]]:
+) -> tuple[dict[int, list[Sample]], tuple[str, ...], dict[str, tuple[int, int]]]:
     samples: dict[int, list[Sample]] = {}
     effective_chunks = _effective_koopman_chunks(
         n_rows=int(warmup_trials),
@@ -808,6 +874,9 @@ def _build_samples_for_w(
         dynamic=bool(dynamic_koopman_chunks),
         disable_below=int(disable_koopman_below_w),
     )
+    feature_names: tuple[str, ...] | None = None
+    view_slices: dict[str, tuple[int, int]] | None = None
+    feature_set = str(warmup_feature_set).strip().lower()
     for s in subjects:
         df_a = by_method[str(anchor_method)][int(s)]
         n_total = int(df_a.shape[0])
@@ -832,16 +901,45 @@ def _build_samples_for_w(
             suffix_gain = float(acc_c_suffix - acc_anchor_suffix)
             final_acc = float((prefix_correct + int(np.sum(cand_correct[w:]))) / float(n_total))
             e2e_gain = float(final_acc - acc_anchor_full)
-            x = _core_features(
-                df_anchor=df_a.iloc[:w].reset_index(drop=True),
-                df_candidate=df_c.iloc[:w].reset_index(drop=True),
-                proba_cols=proba_cols,
-                n_chunks=int(effective_chunks),
-                ridge_lambda=float(ridge_lambda),
-                spectral_gamma=float(spectral_gamma),
-                conflict_tau=float(conflict_tau),
-                conflict_lambda=float(conflict_lambda),
-            )
+            df_a_prefix = df_a.iloc[:w].reset_index(drop=True)
+            df_c_prefix = df_c.iloc[:w].reset_index(drop=True)
+            if feature_set == "compact":
+                x_all = _core_features(
+                    df_anchor=df_a_prefix,
+                    df_candidate=df_c_prefix,
+                    proba_cols=proba_cols,
+                    n_chunks=int(effective_chunks),
+                    ridge_lambda=float(ridge_lambda),
+                    spectral_gamma=float(spectral_gamma),
+                    conflict_tau=float(conflict_tau),
+                    conflict_lambda=float(conflict_lambda),
+                )
+                x, cur_names, cur_slices = _select_compact_features(
+                    x_all,
+                    selected_views=list(compact_selector_views),
+                )
+            elif feature_set == "legacy":
+                x, cur_names, cur_slices = _legacy_selector_feature_bundle(
+                    p_id=df_a_prefix[proba_cols].to_numpy(np.float64),
+                    p_c=df_c_prefix[proba_cols].to_numpy(np.float64),
+                    y_pred_id=df_a_prefix["y_pred"].to_numpy(object),
+                    y_pred_c=df_c_prefix["y_pred"].to_numpy(object),
+                    anchor_family=_legacy_infer_family(str(anchor_method)),
+                    cand_family=_legacy_infer_family(str(m)),
+                    n_classes=len(proba_cols),
+                    feature_mode=str(legacy_feature_mode),
+                    selector_views=list(legacy_selector_views),
+                    dynamic_chunks=int(legacy_dynamic_chunks),
+                    stochastic_bootstrap_rounds=int(legacy_stochastic_bootstrap_rounds),
+                    stochastic_bootstrap_seed=int(legacy_stochastic_bootstrap_seed) + 1009 * int(s),
+                )
+            else:
+                raise ValueError(f"Unsupported warmup_feature_set={warmup_feature_set!r}")
+            if feature_names is None:
+                feature_names = tuple(cur_names)
+                view_slices = dict(cur_slices)
+            elif tuple(cur_names) != feature_names or dict(cur_slices) != dict(view_slices or {}):
+                raise RuntimeError("Warm-up feature metadata changed across samples.")
             raw.append((str(m), x, suffix_gain, e2e_gain))
             candidate_e2e_accs.append(final_acc)
         oracle_e2e = float(max([acc_anchor_full] + candidate_e2e_accs))
@@ -865,7 +963,9 @@ def _build_samples_for_w(
                 )
             )
         samples[int(s)] = subject_samples
-    return samples
+    if feature_names is None or view_slices is None:
+        raise RuntimeError("No warm-up features were built.")
+    return samples, feature_names, view_slices
 
 
 def _online_fallback_accuracy(
@@ -877,6 +977,13 @@ def _online_fallback_accuracy(
     proba_cols: list[str],
     candidate_methods: list[str],
     method_prior_mode: str,
+    warmup_feature_set: str,
+    compact_selector_views: list[str],
+    legacy_selector_views: list[str],
+    legacy_feature_mode: str,
+    legacy_dynamic_chunks: int,
+    legacy_stochastic_bootstrap_rounds: int,
+    legacy_stochastic_bootstrap_seed: int,
     warmup_trials: int,
     window_trials: int,
     fallback_risk_threshold: float,
@@ -921,16 +1028,43 @@ def _online_fallback_accuracy(
             dynamic=bool(dynamic_koopman_chunks),
             disable_below=int(disable_koopman_below_w),
         )
-        x_core = _core_features(
-            df_anchor=df_a.iloc[obs_start:obs_stop].reset_index(drop=True),
-            df_candidate=df_c.iloc[obs_start:obs_stop].reset_index(drop=True),
-            proba_cols=proba_cols,
-            n_chunks=int(effective_chunks),
-            ridge_lambda=float(ridge_lambda),
-            spectral_gamma=float(spectral_gamma),
-            conflict_tau=float(conflict_tau),
-            conflict_lambda=float(conflict_lambda),
-        )
+        df_a_win = df_a.iloc[obs_start:obs_stop].reset_index(drop=True)
+        df_c_win = df_c.iloc[obs_start:obs_stop].reset_index(drop=True)
+        if str(warmup_feature_set).strip().lower() == "legacy":
+            x_core, _names, _slices = _legacy_selector_feature_bundle(
+                p_id=df_a_win[proba_cols].to_numpy(np.float64),
+                p_c=df_c_win[proba_cols].to_numpy(np.float64),
+                y_pred_id=df_a_win["y_pred"].to_numpy(object),
+                y_pred_c=df_c_win["y_pred"].to_numpy(object),
+                anchor_family=_legacy_infer_family(str(anchor_method)),
+                cand_family=_legacy_infer_family(str(method)),
+                n_classes=len(proba_cols),
+                feature_mode=str(legacy_feature_mode),
+                selector_views=list(legacy_selector_views),
+                dynamic_chunks=int(legacy_dynamic_chunks),
+                stochastic_bootstrap_rounds=int(legacy_stochastic_bootstrap_rounds),
+                stochastic_bootstrap_seed=int(legacy_stochastic_bootstrap_seed) + 1009 * int(s),
+            )
+            koop = float("nan")
+        else:
+            x_all = _core_features(
+                df_anchor=df_a_win,
+                df_candidate=df_c_win,
+                proba_cols=proba_cols,
+                n_chunks=int(effective_chunks),
+                ridge_lambda=float(ridge_lambda),
+                spectral_gamma=float(spectral_gamma),
+                conflict_tau=float(conflict_tau),
+                conflict_lambda=float(conflict_lambda),
+            )
+            x_core, x_names, _x_slices = _select_compact_features(
+                x_all,
+                selected_views=list(compact_selector_views),
+            )
+            if "koopman_temporal" in x_names:
+                koop = float(x_core.reshape(-1)[int(x_names.index("koopman_temporal"))])
+            else:
+                koop = float("nan")
         x_win = _augment_feature_vector(
             x_core,
             method=method,
@@ -939,7 +1073,6 @@ def _online_fallback_accuracy(
         ).reshape(1, -1)
         stats = selector.predict_stats(x_win)
         risk = float(np.asarray(stats["risk"]).reshape(-1)[0])
-        koop = float(x_core.reshape(-1)[2])
         bad = (risk > float(fallback_risk_threshold)) or (koop > float(fallback_koopman_threshold))
         bad_count = bad_count + 1 if bad else 0
         if bad_count >= int(fallback_patience):
@@ -980,13 +1113,20 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
     methods = [str(args.anchor_method)] + cand_methods
     by_method = _build_subject_maps(df, methods=methods)
     _validate_alignment(by_method, methods=methods, subjects=subjects)
-    samples_by_subject = _build_samples_for_w(
+    samples_by_subject, base_feature_names, base_view_slices = _build_samples_for_w(
         by_method=by_method,
         anchor_method=str(args.anchor_method),
         candidate_methods=cand_methods,
         subjects=subjects,
         proba_cols=proba_cols,
         warmup_trials=int(w),
+        warmup_feature_set=str(args.warmup_feature_set),
+        compact_selector_views=_parse_compact_selector_views(str(args.compact_selector_views)),
+        legacy_selector_views=_legacy_parse_selector_views(str(args.legacy_selector_views)),
+        legacy_feature_mode=str(args.legacy_feature_mode),
+        legacy_dynamic_chunks=int(args.legacy_dynamic_chunks),
+        legacy_stochastic_bootstrap_rounds=int(args.legacy_stochastic_bootstrap_rounds),
+        legacy_stochastic_bootstrap_seed=int(args.legacy_stochastic_bootstrap_seed),
         n_chunks=int(args.koopman_chunks),
         dynamic_koopman_chunks=bool(args.dynamic_koopman_chunks),
         disable_koopman_below_w=int(args.disable_koopman_below_w),
@@ -999,6 +1139,16 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
     subjects = sorted(samples_by_subject)
     if len(subjects) < 4:
         raise RuntimeError(f"Need at least 4 valid subjects after warm-up filtering, got {len(subjects)}")
+    base_feature_index = {str(name): int(i) for i, name in enumerate(base_feature_names)}
+
+    def _feature_value(vec: np.ndarray, name: str) -> float:
+        idx = base_feature_index.get(str(name))
+        if idx is None:
+            return float("nan")
+        values = np.asarray(vec, dtype=np.float64).reshape(-1)
+        if idx >= int(values.shape[0]):
+            return float("nan")
+        return float(values[idx])
 
     rows: list[dict[str, object]] = []
     for t_idx, test_subject in enumerate(subjects):
@@ -1011,6 +1161,8 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
             selector_fold = _train_selector(
                 samples_by_subject,
                 train_subjects,
+                base_feature_names=base_feature_names,
+                base_view_slices=base_view_slices,
                 candidate_methods=cand_methods,
                 method_prior_mode=str(args.method_prior_mode),
                 outcome_delta=float(args.outcome_delta),
@@ -1060,6 +1212,8 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
         selector_final = _train_selector(
             samples_by_subject,
             fit_subjects,
+            base_feature_names=base_feature_names,
+            base_view_slices=base_view_slices,
             candidate_methods=cand_methods,
             method_prior_mode=str(args.method_prior_mode),
             outcome_delta=float(args.outcome_delta),
@@ -1109,7 +1263,7 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
             utility = float("nan")
             uncertainty = float("nan")
             p_harm = p_neutral = p_benefit = float("nan")
-            selected_x = np.asarray([float("nan"), float("nan"), float("nan")], dtype=np.float64)
+            selected_x = np.full((len(base_feature_names),), float("nan"), dtype=np.float64)
             fallback_info = {
                 "fallback_at_trial": -1,
                 "fallback_risk": float("nan"),
@@ -1147,6 +1301,13 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
                     proba_cols=proba_cols,
                     candidate_methods=cand_methods,
                     method_prior_mode=str(args.method_prior_mode),
+                    warmup_feature_set=str(args.warmup_feature_set),
+                    compact_selector_views=_parse_compact_selector_views(str(args.compact_selector_views)),
+                    legacy_selector_views=_legacy_parse_selector_views(str(args.legacy_selector_views)),
+                    legacy_feature_mode=str(args.legacy_feature_mode),
+                    legacy_dynamic_chunks=int(args.legacy_dynamic_chunks),
+                    legacy_stochastic_bootstrap_rounds=int(args.legacy_stochastic_bootstrap_rounds),
+                    legacy_stochastic_bootstrap_seed=int(args.legacy_stochastic_bootstrap_seed),
                     warmup_trials=int(w),
                     window_trials=int(args.fallback_window_trials or w),
                     fallback_risk_threshold=float(fb_thr),
@@ -1203,15 +1364,15 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
                 "p_harm": p_harm,
                 "p_neutral": p_neutral,
                 "p_benefit": p_benefit,
-                "selected_absolute_core": float(selected_x[0]),
-                "selected_relative_core": float(selected_x[1]),
-                "selected_koopman_temporal": float(selected_x[2]),
+                "selected_absolute_core": _feature_value(selected_x, "absolute_core"),
+                "selected_relative_core": _feature_value(selected_x, "relative_core"),
+                "selected_koopman_temporal": _feature_value(selected_x, "koopman_temporal"),
                 "pre_best_method": str(best_pre.sample.method),
                 "pre_best_risk": float(best_pre.risk),
                 "pre_best_utility": float(best_pre.utility),
-                "pre_best_absolute_core": float(best_pre.sample.x[0]),
-                "pre_best_relative_core": float(best_pre.sample.x[1]),
-                "pre_best_koopman_temporal": float(best_pre.sample.x[2]),
+                "pre_best_absolute_core": _feature_value(best_pre.sample.x, "absolute_core"),
+                "pre_best_relative_core": _feature_value(best_pre.sample.x, "relative_core"),
+                "pre_best_koopman_temporal": _feature_value(best_pre.sample.x, "koopman_temporal"),
                 "threshold_verified": bool(thr.get("verified", False)),
                 "fallback_stage": str(thr.get("fallback_stage", "")),
                 "risk_threshold": float(thr.get("risk_threshold", float("nan"))),
@@ -1249,6 +1410,9 @@ def run_one_w(args: argparse.Namespace, *, w: int) -> tuple[pd.DataFrame, dict[s
         "threshold_verified_rate": float(per_subject["threshold_verified"].mean()),
         "online_fallback": int(bool(args.online_fallback)),
         "method_prior_mode": str(args.method_prior_mode),
+        "warmup_feature_set": str(args.warmup_feature_set),
+        "compact_selector_views": str(args.compact_selector_views),
+        "legacy_selector_views": str(args.legacy_selector_views),
         "selection_policy": str(args.selection_policy),
         "default_candidate_method": str(default_method),
         "risk_only_selection": int(bool(args.risk_only_selection)),
@@ -1275,6 +1439,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--method-name", type=str, default="safe-tts-warmup-koopman")
     p.add_argument("--date-prefix", type=str, default=datetime.now().strftime("%Y%m%d"))
     p.add_argument("--eval-subjects", type=str, default="ALL")
+    p.add_argument("--warmup-feature-set", type=str, choices=("compact", "legacy"), default="compact")
+    p.add_argument(
+        "--compact-selector-views",
+        type=str,
+        default="absolute,relative,koopman",
+        help="Comma-separated compact views. Choices/aliases: absolute,relative,koopman.",
+    )
+    p.add_argument("--legacy-selector-views", type=str, default="stats,decision,relative,dynamic")
+    p.add_argument("--legacy-feature-mode", type=str, choices=("delta", "anchor_delta"), default="delta")
+    p.add_argument("--legacy-dynamic-chunks", type=int, default=4)
+    p.add_argument("--legacy-stochastic-bootstrap-rounds", type=int, default=16)
+    p.add_argument("--legacy-stochastic-bootstrap-seed", type=int, default=0)
     p.add_argument("--method-prior-mode", type=str, choices=("none", "onehot"), default="none")
     p.add_argument("--selection-policy", type=str, choices=("free", "default_veto_switch"), default="free")
     p.add_argument("--default-candidate-method", type=str, default="")

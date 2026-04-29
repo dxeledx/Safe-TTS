@@ -1,1 +1,0 @@
-python ./tl/dnn.py
