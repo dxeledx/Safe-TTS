@@ -1,138 +1,214 @@
 # Safe-TTS
 
-Safe-TTS is a compact Python toolkit for selecting safe test-time strategies from saved prediction CSV files. It works on trial-level prediction tables produced by EEG/BCI classifiers or adaptation methods, then writes subject-level selections, merged predictions, and summary metrics.
+Safe-TTS is a research codebase for safe test-time strategy selection on
+motor-imagery EEG. It works from merged per-trial prediction files produced by
+an anchor classifier and multiple test-time adaptation (TTA) candidates. The
+selector scores the candidates and either deploys one candidate prediction or
+falls back to the anchor prediction.
 
-The repository is intentionally small: it contains the selector scripts, feature/certificate utilities, and minimal dependencies needed to run them.
+The current selector code supports trial-level multi-candidate selection with a
+three-view diagnostic representation:
 
-## File Tree
+- an absolute view for candidate reliability,
+- a relative view for anchor-candidate drift,
+- a temporal view for within-candidate dynamics.
+
+Generated data, checkpoints, experiment outputs, logs, and paper assets are not
+intended to be versioned in this repository.
+
+## Repository Tree
 
 ```text
-Safe-TTS/
-├── README.md
-├── requirements.txt
+.
 ├── csp_lda/
-│   ├── __init__.py
-│   ├── alignment.py
-│   ├── certificate.py
-│   └── proba.py
-└── scripts/
-    ├── offline_safe_tta_multi_select_crc_from_predictions.py
-    ├── offline_safe_tta_multi_select_from_predictions.py
-    ├── offline_safe_tta_select_from_predictions.py
-    └── safe_tts/
-        ├── __init__.py
-        └── run_warmup_safe_tts_from_predictions.py
+│   ├── certificate.py                       # Certificate, guard, and evidential selector utilities
+│   ├── alignment.py                         # EA/OEA alignment helpers
+│   └── proba.py                             # Probability-column helpers
+├── scripts/
+│   ├── safe_tts/
+│   │   ├── run_trial_safe_tts_from_predictions.py
+│   │   ├── run_warmup_safe_tts_from_predictions.py
+│   │   └── README.md
+│   ├── offline_safe_tta_multi_select_from_predictions.py
+│   ├── offline_safe_tta_multi_select_crc_from_predictions.py
+│   └── offline_safe_tta_select_from_predictions.py
+└── requirements.txt
 ```
 
-## Requirements
+## Installation
 
-- Python 3.10+
-- numpy
-- pandas
-- scipy
-- scikit-learn
-- torch
-
-Install with:
+Python 3.10+ is recommended. The original experiments were usually run in a
+Conda environment named `eeg`.
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -U pip
+python3 -m pip install -r requirements.txt
 ```
 
-## Input Format
+If CUDA is used, install the PyTorch build that matches the local driver before
+running the TTA suite.
 
-The main scripts expect a trial-level CSV with one row per method, subject, and trial:
+## Prediction File Format
+
+The trial-level Safe-TTS selector consumes a merged CSV containing the anchor
+method and all candidate methods. Required columns:
 
 ```text
-method,subject,trial,y_true,y_pred,proba_<class_1>,proba_<class_2>,...
+method, subject, trial, y_true, y_pred, proba_<class_1>, ..., proba_<class_C>
 ```
 
-Example columns:
+The selector uses `y_true` only for source-subject training/calibration and for
+writing evaluation files. Target-subject candidate selection is based on
+prediction-derived diagnostics.
+
+## Trial-level Three-view Selector
+
+The main trial-level entry point is:
 
 ```text
-method,subject,trial,y_true,y_pred,proba_left_hand,proba_right_hand,proba_feet
+scripts/safe_tts/run_trial_safe_tts_from_predictions.py
 ```
 
-Each candidate method should share the same `subject` and `trial` indexing as the anchor method.
+For each subject, trial, and candidate method, the script constructs a
+label-free feature vector from anchor and candidate predictions. Candidate
+features are grouped into three views.
 
-## Main Scripts
+### Absolute View
 
-### Multi-candidate risk-controlled selector
+The absolute view describes whether the candidate prediction itself appears
+reliable.
+
+```text
+absolute_core
+candidate_confidence
+candidate_margin
+```
+
+- `absolute_core`: normalized candidate certainty.
+- `candidate_confidence`: maximum candidate class probability.
+- `candidate_margin`: gap between the largest and second-largest candidate
+  probabilities.
+
+### Relative View
+
+The relative view describes how the candidate prediction differs from the anchor
+prediction.
+
+```text
+relative_core
+js_drift
+confidence_delta
+entropy_delta
+prediction_disagree
+high_conflict
+```
+
+- `relative_core`: drift score with an optional high-confidence conflict
+  weight.
+- `js_drift`: normalized Jensen-Shannon divergence between anchor and candidate
+  probability vectors.
+- `confidence_delta`: candidate confidence minus anchor confidence.
+- `entropy_delta`: candidate entropy minus anchor entropy.
+- `prediction_disagree`: whether anchor and candidate predicted different
+  classes.
+- `high_conflict`: whether anchor and candidate disagree while both are
+  high-confidence.
+
+### Temporal View
+
+The temporal view describes within-candidate trial-to-trial dynamics.
+
+```text
+koopman_temporal
+```
+
+The implementation forms a low-dimensional state from candidate certainty,
+relative drift, and high-confidence conflict, then measures normalized
+state-transition magnitude across adjacent trials of the same subject and
+candidate method.
+
+### Feature Configuration
+
+The compact preset keeps one statistic per view:
 
 ```bash
-python scripts/offline_safe_tta_multi_select_crc_from_predictions.py \
-  --preds outputs/predictions_all_methods.csv \
+--trial-feature-preset compact
+```
+
+The current explicit three-view feature set can be passed as:
+
+```bash
+--trial-feature-preset rich \
+--trial-feature-names absolute_core,candidate_confidence,candidate_margin,relative_core,js_drift,confidence_delta,entropy_delta,prediction_disagree,high_conflict,koopman_temporal
+```
+
+## Multi-candidate Selection
+
+The trial-level selector supports free multi-candidate selection:
+
+```bash
+python3 scripts/safe_tts/run_trial_safe_tts_from_predictions.py \
+  --preds outputs/physionetmi3_tta_suite/predictions_all_methods.csv \
+  --out-dir outputs/trial_safe_tts \
   --anchor-method eegnet_noea \
-  --candidate-methods ALL \
-  --selector-model evidential \
-  --selector-views stats,decision,relative \
-  --calibration-protocol paper_oof_dev_cal \
-  --risk-alpha 0.40 \
-  --out-dir outputs/safe_tts_run \
-  --method-name safe_tts \
-  --date-prefix 20260429
+  --candidate-methods adabn_kooptta_ref,shot_kooptta_ref,tent_kooptta_ref \
+  --selection-policy free \
+  --risk-only-selection \
+  --risk-alpha 0.25 \
+  --trial-feature-preset rich \
+  --trial-feature-names absolute_core,candidate_confidence,candidate_margin,relative_core,js_drift,confidence_delta,entropy_delta,prediction_disagree,high_conflict,koopman_temporal
 ```
 
-Useful selector view options:
-
-```text
-stats
-decision
-relative
-dynamic
-koopman
-stochastic
-absolute_core
-relative_core
-koopman_temporal
-compact
-```
+For each trial, feasible candidates are filtered by predicted risk. Among
+feasible candidates, the selector chooses the candidate with the highest
+predicted utility. If no candidate passes the risk gate, the final prediction is
+the anchor prediction.
 
 The script writes:
 
 ```text
-<date>_predictions_all_methods.csv
-<date>_per_subject_selection.csv
-<date>_method_comparison.csv
+<date>_trial_method_comparison.csv      # run-level summary
+<date>_trial_per_subject_summary.csv    # per-subject accuracy and selection summary
+<date>_trial_per_trial_selection.csv    # per-trial selected method and final prediction
 ```
 
-### Warm-up selector
+## Warm-up Selector
+
+The warm-up entry point is:
+
+```text
+scripts/safe_tts/run_warmup_safe_tts_from_predictions.py
+```
+
+It uses the first `W` target trials as an unlabeled observation prefix. During
+the prefix, user-visible predictions come from the anchor while candidate
+methods can run in the background. After the prefix, the script chooses a
+candidate or keeps the anchor according to prefix diagnostics.
+
+Example:
 
 ```bash
-python scripts/safe_tts/run_warmup_safe_tts_from_predictions.py \
-  --preds outputs/predictions_all_methods.csv \
+python3 scripts/safe_tts/run_warmup_safe_tts_from_predictions.py \
+  --preds outputs/physionetmi3_tta_suite/predictions_all_methods.csv \
   --out-dir outputs/warmup_safe_tts \
   --anchor-method eegnet_noea \
   --candidate-methods adabn_kooptta_ref,shot_kooptta_ref,tent_kooptta_ref \
-  --warmup-trials 8,16,24,32 \
-  --warmup-feature-set compact \
-  --compact-selector-views absolute,relative,koopman \
-  --selection-policy default_veto_switch \
-  --default-candidate-method adabn_kooptta_ref \
+  --warmup-trials 8 \
   --risk-alpha 0.40
 ```
 
-This script evaluates a prefix-based selection protocol. It writes one per-subject CSV for each warm-up length and a combined method-comparison CSV.
-
-### Single-candidate selector
+## Tests
 
 ```bash
-python scripts/offline_safe_tta_select_from_predictions.py \
-  --ea-preds outputs/anchor_predictions.csv \
-  --cand-preds outputs/candidate_predictions.csv \
-  --out-dir outputs/single_candidate_run
+python3 -m pytest tests
 ```
 
-## Core Utilities
+Full EEG experiments require MOABB data, exported datasets, and trained
+prediction files.
 
-- `csp_lda/certificate.py`: feature construction, ridge certificates, logistic/HGB guards, and evidential selector training.
-- `csp_lda/alignment.py`: alignment helpers used by the shared certificate module.
-- `csp_lda/proba.py`: probability-column reordering helper.
+## License
 
-## Notes
-
-- The code operates on saved predictions; it does not require raw EEG data for selector evaluation.
-- Large experiment outputs, checkpoints, datasets, and generated figures are intentionally not tracked in this repository.
-- Keep prediction CSVs and result directories outside git, for example under `outputs/`.
+No project-level license has been declared yet. Vendored or third-party code
+keeps its upstream license and notices.

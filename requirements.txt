@@ -1,5 +1,19 @@
-numpy>=1.23
-pandas>=1.5
-scipy>=1.9
-scikit-learn>=1.2
-torch>=2.0
+# Core
+numpy
+pandas
+matplotlib
+scikit-learn
+mne
+scipy
+torch
+skorch
+einops
+
+# EEG/BCI libs
+braindecode
+
+# MOABB (GitHub install as requested)
+git+https://github.com/NeuroTechX/moabb.git
+
+# Development
+pytest
